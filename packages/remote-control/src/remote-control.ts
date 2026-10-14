@@ -29,7 +29,11 @@ export function resolveRemoteControlRelayOrigin(
 }
 
 const MAX_HTTP_HEADER_BYTES = 64 * 1024;
-const MAX_HTTP_REQUEST_BYTES = 10 * 1024 * 1024;
+const MAX_HTTP_REQUEST_BYTES = 104 * 1024 * 1024;
+const MAX_PENDING_HTTP_BYTES = 2 * MAX_HTTP_REQUEST_BYTES;
+const MAX_SINGLE_FRAME_RESPONSE_BYTES = 10 * 1024 * 1024;
+const RESPONSE_CHUNK_BYTES = 5 * 1024 * 1024;
+const HTTP_TUNNEL_CAPABILITIES = 'request_chunk,response_chunk,abort';
 const HTTP_REQUEST_TIMEOUT_MS = 30_000;
 const REGISTER_TIMEOUT_MS = 10_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -362,10 +366,14 @@ class RemoteControlClient {
   private readonly onStatus: (status: RemoteControlStatus) => void;
   private readonly streams = new Map<string, ActiveStream>();
   private readonly pendingHttpRequests = new Map<string, PendingHttpRequest>();
+  private readonly httpByteCharges = new Map<string, number>();
   private readonly pendingSockets = new Set<WebSocket>();
+  private readonly localForwards = new Map<string, () => void>();
   private management: WebSocket | undefined;
+  private managementWrites: SocketWriteQueue | undefined;
   private reconnectAbort: AbortController | undefined;
   private http: WebSocket | undefined;
+  private httpWrites: HttpWriteQueue | undefined;
   private pendingHttpBytes = 0;
   private reconnectAttempt = 0;
   private reconnectImmediately = false;
@@ -422,9 +430,11 @@ class RemoteControlClient {
     this.stopped = true;
     if (!this.connected) this.rejectInitial(new Error('Remote Control closed before ready.'));
     if (this.management?.readyState === WebSocket.OPEN) {
-      this.management.send(
-        JSON.stringify({ type: 'disconnect', payload: { reason: 'local_server_stopped' } }),
-      );
+      await this.managementWrites
+        ?.send(
+          JSON.stringify({ type: 'disconnect', payload: { reason: 'local_server_stopped' } }),
+        )
+        .catch(() => {});
     }
     this.closeCycle();
     this.reconnectAbort?.abort();
@@ -469,19 +479,23 @@ class RemoteControlClient {
   private async serveCycle(): Promise<void> {
     const management = await this.connectRelay('/v1/remote/create');
     this.management = management;
+    const managementWrites = new SocketWriteQueue(management);
+    this.managementWrites = managementWrites;
     this.watchSocket(management, 'management');
-    management.send(
-      JSON.stringify({
-        type: 'register',
-        payload: {
-          device_id: this.deviceId,
-          alias: hostname(),
-          platform: platform(),
-          client_version: this.clientVersion,
-          local_base_url: this.localOrigin,
-        },
-      }),
-    );
+    void managementWrites
+      .send(
+        JSON.stringify({
+          type: 'register',
+          payload: {
+            device_id: this.deviceId,
+            alias: hostname(),
+            platform: platform(),
+            client_version: this.clientVersion,
+            local_base_url: this.localOrigin,
+          },
+        }),
+      )
+      .catch(() => {});
     const registration = await waitForRelayMessage(management, REGISTER_TIMEOUT_MS);
     if (registration.type === 'register_nak') {
       const code = stringField(registration.payload, 'error_code') ?? 'REGISTRATION_REJECTED';
@@ -494,9 +508,25 @@ class RemoteControlClient {
 
     const managementEnd = waitForSocketEnd(management);
     const http = await this.connectRelay(
-      `/v1/remote/http?device_id=${encodeURIComponent(this.deviceId)}`,
+      `/v1/remote/http?device_id=${encodeURIComponent(this.deviceId)}&capabilities=${HTTP_TUNNEL_CAPABILITIES}`,
     );
     this.http = http;
+    const httpWrites = new HttpWriteQueue(http, (requestId) => {
+      if (this.httpWrites !== httpWrites) return;
+      httpWrites.enqueue(
+        requestId,
+        () =>
+          JSON.stringify({
+            request_id: requestId,
+            type: 'abort',
+            is_last: true,
+            body_base64: '',
+            reason: 'local_server_error',
+          }),
+        false,
+      );
+    });
+    this.httpWrites = httpWrites;
     this.watchSocket(http, 'http');
     if (management.readyState !== WebSocket.OPEN) {
       throw new Error('management connection closed');
@@ -595,6 +625,11 @@ class RemoteControlClient {
     let requestId: string | undefined;
     try {
       const parsed = JSON.parse(text) as Record<string, unknown>;
+      if (parsed['type'] === 'abort') {
+        const abortedId = typeof parsed['request_id'] === 'string' ? parsed['request_id'] : undefined;
+        if (abortedId !== undefined) this.abortHttpTransfer(abortedId);
+        return;
+      }
       if (parsed['type'] !== 'request') return;
       requestId = typeof parsed['request_id'] === 'string' ? parsed['request_id'] : undefined;
       if (
@@ -606,21 +641,26 @@ class RemoteControlClient {
       }
       const bodyBase64 = parsed['body_base64'];
       const minDecodedBytes = Math.floor(bodyBase64.length / 4) * 3 - 2;
-      if (this.pendingHttpBytes + minDecodedBytes > MAX_HTTP_REQUEST_BYTES) {
-        throw new SyntaxError('HTTP tunnel request exceeds 10 MiB');
+      if (this.pendingHttpBytes + minDecodedBytes > MAX_PENDING_HTTP_BYTES) {
+        throw new SyntaxError(
+          `HTTP tunnel pending bytes exceed ${MAX_PENDING_HTTP_BYTES / 1024 / 1024} MiB`,
+        );
       }
       const chunk = decodeBase64(bodyBase64);
       const pending = this.pendingHttpRequests.get(requestId) ?? { chunks: [], size: 0 };
-      if (this.pendingHttpBytes + chunk.length > MAX_HTTP_REQUEST_BYTES) {
-        throw new SyntaxError('HTTP tunnel request exceeds 10 MiB');
+      if (pending.size + chunk.length > MAX_HTTP_REQUEST_BYTES) {
+        throw new SyntaxError(
+          `HTTP tunnel request exceeds ${MAX_HTTP_REQUEST_BYTES / 1024 / 1024} MiB`,
+        );
       }
       pending.chunks.push(chunk);
       pending.size += chunk.length;
       this.pendingHttpBytes += chunk.length;
+      this.httpByteCharges.set(requestId, pending.size);
       this.pendingHttpRequests.set(requestId, pending);
       if (!parsed['is_last']) return;
       const rawRequest = Buffer.concat(pending.chunks, pending.size);
-      this.clearPendingHttpRequest(requestId);
+      this.pendingHttpRequests.delete(requestId);
       void this.forwardHttpRequest(requestId, rawRequest);
     } catch (error) {
       if (requestId !== undefined) {
@@ -633,32 +673,80 @@ class RemoteControlClient {
   }
 
   private async forwardHttpRequest(requestId: string, rawRequest: Buffer): Promise<void> {
+    let canceled = false;
+    let cancelLocal: (() => void) | undefined;
+    const entry = (): void => {
+      canceled = true;
+      cancelLocal?.();
+    };
+    this.localForwards.set(requestId, entry);
     try {
       const parsed = parseRawHttpRequest(rawRequest);
-      const response = await requestLocalHttp(
+      const call = requestLocalHttp(
         this.localOrigin,
         parsed,
         this.localServerToken(),
         this.publicPrefix(),
       );
+      cancelLocal = call.cancel;
+      const response = await call.response;
+      if (canceled) return;
       this.sendHttpResponse(requestId, response);
     } catch (error) {
+      if (canceled) return;
       const status = error instanceof SyntaxError ? 400 : 502;
       this.sendHttpResponse(requestId, buildErrorResponse(status));
       this.stderr.write(`Remote Control HTTP forwarding failed: ${errorMessage(error)}\n`);
+    } finally {
+      this.releaseHttpBytes(requestId);
+      if (this.localForwards.get(requestId) === entry) this.localForwards.delete(requestId);
     }
   }
 
+  private abortHttpTransfer(requestId: string): void {
+    this.clearPendingHttpRequest(requestId);
+    this.httpWrites?.drop(requestId);
+    const cancel = this.localForwards.get(requestId);
+    if (cancel === undefined) return;
+    this.localForwards.delete(requestId);
+    cancel();
+  }
+
   private sendHttpResponse(requestId: string, response: Buffer): void {
-    if (this.http?.readyState !== WebSocket.OPEN) return;
-    this.http.send(
-      JSON.stringify({
-        request_id: requestId,
-        type: 'response',
-        is_last: true,
-        body_base64: response.toString('base64'),
-      }),
-    );
+    const queue = this.httpWrites;
+    if (queue === undefined) return;
+    if (response.length <= MAX_SINGLE_FRAME_RESPONSE_BYTES) {
+      queue.enqueue(requestId, () =>
+        JSON.stringify({
+          request_id: requestId,
+          type: 'response',
+          is_last: true,
+          body_base64: response.toString('base64'),
+        }),
+      );
+      return;
+    }
+    for (let offset = 0; offset < response.length; offset += RESPONSE_CHUNK_BYTES) {
+      const end = Math.min(offset + RESPONSE_CHUNK_BYTES, response.length);
+      queue.enqueue(requestId, () =>
+        JSON.stringify({
+          request_id: requestId,
+          type: 'response_chunk',
+          is_last: end === response.length && response.length % RESPONSE_CHUNK_BYTES !== 0,
+          body_base64: response.subarray(offset, end).toString('base64'),
+        }),
+      );
+    }
+    if (response.length % RESPONSE_CHUNK_BYTES === 0) {
+      queue.enqueue(requestId, () =>
+        JSON.stringify({
+          request_id: requestId,
+          type: 'response_chunk',
+          is_last: true,
+          body_base64: '',
+        }),
+      );
+    }
   }
 
   private async openStream(payload: Record<string, unknown>): Promise<void> {
@@ -743,16 +831,24 @@ class RemoteControlClient {
   }
 
   private clearPendingHttpRequest(requestId: string): void {
-    const pending = this.pendingHttpRequests.get(requestId);
-    if (pending === undefined) return;
     this.pendingHttpRequests.delete(requestId);
-    this.pendingHttpBytes -= pending.size;
+    this.releaseHttpBytes(requestId);
+  }
+
+  private releaseHttpBytes(requestId: string): void {
+    const size = this.httpByteCharges.get(requestId);
+    if (size === undefined) return;
+    this.httpByteCharges.delete(requestId);
+    this.pendingHttpBytes -= size;
   }
 
   private closeCycle(): void {
     for (const streamId of this.streams.keys()) this.closeStream(streamId);
     this.pendingHttpRequests.clear();
+    this.httpByteCharges.clear();
     this.pendingHttpBytes = 0;
+    for (const cancel of this.localForwards.values()) cancel();
+    this.localForwards.clear();
     for (const socket of this.pendingSockets) socket.terminate();
     this.pendingSockets.clear();
     this.management?.close();
@@ -762,7 +858,9 @@ class RemoteControlClient {
       this.onStatus(this.userRequested ? 'relay_terminated' : 'relay_disconnected');
     }
     this.management = undefined;
+    this.managementWrites = undefined;
     this.http = undefined;
+    this.httpWrites = undefined;
   }
 
   private publicPrefix(): string {
@@ -780,6 +878,102 @@ class RemoteControlClient {
       if (!(error instanceof Error) || error.name !== 'AbortError') throw error;
     } finally {
       if (this.reconnectAbort === controller) this.reconnectAbort = undefined;
+    }
+  }
+}
+
+export class SocketWriteQueue {
+  private chain: Promise<void> = Promise.resolve();
+
+  constructor(private readonly socket: WebSocket) {}
+
+  send(data: RawData | string, binary = false): Promise<void> {
+    const queued = this.chain.then(() => this.write(data, binary));
+    this.chain = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  idle(): Promise<void> {
+    return this.chain;
+  }
+
+  private write(data: RawData | string, binary: boolean): Promise<void> {
+    if (this.socket.readyState !== WebSocket.OPEN) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this.socket.send(data, { binary }, (error) => {
+        if (error === undefined || error === null) resolve();
+        else reject(error);
+      });
+    });
+  }
+}
+
+interface HttpQueuedFrame {
+  readonly serialize: () => string;
+  readonly reportFailure: boolean;
+}
+
+export class HttpWriteQueue {
+  private readonly frames = new Map<string, HttpQueuedFrame[]>();
+  private pumping = false;
+
+  constructor(
+    private readonly socket: WebSocket,
+    private readonly onSendFailed: (requestId: string) => void,
+  ) {}
+
+  enqueue(requestId: string, serialize: () => string, reportFailure = true): void {
+    const frame = { serialize, reportFailure };
+    const pending = this.frames.get(requestId);
+    if (pending === undefined) this.frames.set(requestId, [frame]);
+    else pending.push(frame);
+    void this.pump();
+  }
+
+  drop(requestId: string): void {
+    this.frames.delete(requestId);
+  }
+
+  private async pump(): Promise<void> {
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      for (;;) {
+        const first = this.frames.keys().next();
+        if (first.done) return;
+        const requestId = first.value;
+        const pending = this.frames.get(requestId)!;
+        if (this.socket.readyState !== WebSocket.OPEN) {
+          this.frames.clear();
+          return;
+        }
+        const frame = pending[0]!;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            this.socket.send(frame.serialize(), (error) => {
+              if (error === undefined || error === null) resolve();
+              else reject(error);
+            });
+          });
+        } catch {
+          this.frames.delete(requestId);
+          if (this.socket.readyState !== WebSocket.OPEN) {
+            this.frames.clear();
+            return;
+          }
+          if (frame.reportFailure) this.onSendFailed(requestId);
+          continue;
+        }
+        if (this.frames.get(requestId) !== pending) continue;
+        pending.shift();
+        this.frames.delete(requestId);
+        if (pending.length > 0) this.frames.set(requestId, pending);
+      }
+    } finally {
+      this.pumping = false;
     }
   }
 }
@@ -901,15 +1095,21 @@ function parseRelayMessage(data: RawData): RelayMessage {
   return { type: parsed['type'], payload };
 }
 
+interface LocalHttpCall {
+  readonly response: Promise<Buffer>;
+  readonly cancel: () => void;
+}
+
 function requestLocalHttp(
   localOrigin: string,
   parsed: ParsedRawHttpRequest,
   serverToken: string,
   publicPrefix: string,
-): Promise<Buffer> {
+): LocalHttpCall {
   const origin = new URL(localOrigin);
-  return new Promise((resolve, reject) => {
-    const request = httpRequest(
+  let request: ReturnType<typeof httpRequest>;
+  const response = new Promise<Buffer>((resolve, reject) => {
+    request = httpRequest(
       {
         protocol: origin.protocol,
         hostname: origin.hostname,
@@ -923,24 +1123,24 @@ function requestLocalHttp(
         ],
         timeout: HTTP_REQUEST_TIMEOUT_MS,
       },
-      (response) => {
+      (localResponse) => {
         const chunks: Buffer[] = [];
-        response.on('data', (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
-        response.once('error', reject);
-        response.once('end', () => {
+        localResponse.on('data', (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
+        localResponse.once('error', reject);
+        localResponse.once('end', () => {
           void (async (): Promise<Buffer> => {
-            const contentType = response.headers['content-type'] ?? '';
+            const contentType = localResponse.headers['content-type'] ?? '';
             const receivedBody = Buffer.concat(chunks);
             let body =
-              response.headers['content-encoding'] === undefined
+              localResponse.headers['content-encoding'] === undefined
                 ? rewriteRemoteControlResponse(contentType, receivedBody, publicPrefix)
                 : receivedBody;
             const rewritten = body !== receivedBody;
-            const headers = filterResponseHeaders(response.rawHeaders, rewritten);
+            const headers = filterResponseHeaders(localResponse.rawHeaders, rewritten);
             if (rewritten) {
               const etag = rewrittenResponseETag(body);
               headers.push('Cache-Control', 'no-cache', 'ETag', etag);
-              const statusCode = response.statusCode ?? 502;
+              const statusCode = localResponse.statusCode ?? 502;
               const revalidatable =
                 (parsed.method === 'GET' || parsed.method === 'HEAD') &&
                 statusCode >= 200 &&
@@ -950,8 +1150,8 @@ function requestLocalHttp(
               }
             }
             const negotiated =
-              response.headers['content-encoding'] === undefined &&
-              response.statusCode !== 206 &&
+              localResponse.headers['content-encoding'] === undefined &&
+              localResponse.statusCode !== 206 &&
               body.length >= GZIP_MIN_BODY_BYTES &&
               isGzipCompressibleType(contentType);
             if (negotiated) {
@@ -971,8 +1171,8 @@ function requestLocalHttp(
               headers.push('Content-Encoding', 'gzip');
             }
             headers.push('Content-Length', String(body.length));
-            const statusCode = response.statusCode ?? 502;
-            const statusMessage = response.statusMessage ?? 'Bad Gateway';
+            const statusCode = localResponse.statusCode ?? 502;
+            const statusMessage = localResponse.statusMessage ?? 'Bad Gateway';
             return Buffer.concat([
               Buffer.from(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n${headerLines(headers)}\r\n\r\n`),
               body,
@@ -985,6 +1185,7 @@ function requestLocalHttp(
     request.once('error', reject);
     request.end(parsed.body);
   });
+  return { response, cancel: () => request.destroy(new Error('local HTTP request canceled')) };
 }
 
 function filterResponseHeaders(rawHeaders: readonly string[], blockCacheValidators = false): string[] {
@@ -1036,26 +1237,39 @@ function bridgeSockets(
   onClose: () => void,
   earlyLeftFrames?: [RawData, boolean][],
 ): void {
+  const leftWrites = new SocketWriteQueue(left);
+  const rightWrites = new SocketWriteQueue(right);
   let closed = false;
   const closeBoth = (code = 1000, reason = Buffer.alloc(0)): void => {
     if (closed) return;
     closed = true;
     onClose();
     const safeCode = isValidCloseCode(code) ? code : 1000;
-    if (left.readyState === WebSocket.OPEN) left.close(safeCode, reason);
-    if (right.readyState === WebSocket.OPEN) right.close(safeCode, reason);
+    const closeWhenDrained = (socket: WebSocket, writes: SocketWriteQueue): void => {
+      void writes.idle().then(() => {
+        if (socket.readyState === WebSocket.OPEN) socket.close(safeCode, reason);
+      });
+    };
+    closeWhenDrained(left, leftWrites);
+    closeWhenDrained(right, rightWrites);
   };
   if (earlyLeftFrames !== undefined) {
     left.removeAllListeners('message');
     for (const [data, isBinary] of earlyLeftFrames) {
-      if (right.readyState === WebSocket.OPEN) right.send(data, { binary: isBinary });
+      void rightWrites.send(data, isBinary).catch(() => {
+        closeBoth(1011);
+      });
     }
   }
   left.on('message', (data, isBinary) => {
-    if (right.readyState === WebSocket.OPEN) right.send(data, { binary: isBinary });
+    void rightWrites.send(data, isBinary).catch(() => {
+      closeBoth(1011);
+    });
   });
   right.on('message', (data, isBinary) => {
-    if (left.readyState === WebSocket.OPEN) left.send(data, { binary: isBinary });
+    void leftWrites.send(data, isBinary).catch(() => {
+      closeBoth(1011);
+    });
   });
   left.once('close', closeBoth);
   right.once('close', closeBoth);
