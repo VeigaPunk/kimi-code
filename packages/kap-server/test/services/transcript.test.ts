@@ -51,6 +51,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { bindSessionTranscript } from '../../src/services/transcript/coreBinding';
 import { toWireQuestion } from '../../src/protocol/question-wire';
 import type { AgentActivitySnapshot } from '@moonshot-ai/agent-core-v2/agent/loop/loop';
+import type { PromptOrigin } from '@moonshot-ai/agent-core-v2/agent/contextMemory/types';
 import type { LegacyActivityApproval } from '../../src/services/legacyStatus/legacyStatus';
 import {
   AgentTranscriptProjector,
@@ -3681,7 +3682,7 @@ describe('bindSessionTranscript', () => {
       this.closeHandlers.add(cb);
       return { dispose: () => this.closeHandlers.delete(cb) };
     }
-    add(id: string, opts?: { loopStatus?: { state?: 'idle' | 'running'; activeTurnId?: number }; tasks?: readonly unknown[]; activePromptId?: string }): FakeAgentHandle {
+    add(id: string, opts?: { loopStatus?: { state?: 'idle' | 'running'; activeTurnId?: number }; tasks?: readonly unknown[]; activePromptId?: string; activePromptOrigin?: PromptOrigin; activePromptText?: string }): FakeAgentHandle {
       const bus = this.handles.get(id)?.bus ?? new FakeBus();
       const undoParticipants = new Map<string, AgentConversationUndoParticipant>();
       const scope = makeAgentScopeContext({
@@ -3736,9 +3737,9 @@ describe('bindSessionTranscript', () => {
                       state: 'running' as const,
                       message: {
                         role: 'user' as const,
-                        content: [{ type: 'text' as const, text: 'hi' }],
+                        content: [{ type: 'text' as const, text: opts?.activePromptText ?? 'hi' }],
                         toolCalls: [],
-                        origin: { kind: 'user' as const },
+                        origin: opts?.activePromptOrigin ?? { kind: 'user' as const },
                       },
                       launched: Promise.resolve(undefined),
                       completion: new Promise(() => {}),
@@ -4320,6 +4321,12 @@ describe('bindSessionTranscript', () => {
         loopStatus: { state: 'running', activeTurnId: 0 },
         activePromptId: 'prompt-1',
       });
+      agents.add('sub-1', {
+        loopStatus: { state: 'running', activeTurnId: 0 },
+        activePromptId: 'prompt-goal',
+        activePromptOrigin: { kind: 'system_trigger', name: 'goal_continuation' },
+        activePromptText: 'Continue working toward the active goal.',
+      });
       const service = new TranscriptService({
         homeDir: home,
         core: fakeCoreWithAgents(agents),
@@ -4331,6 +4338,8 @@ describe('bindSessionTranscript', () => {
         triggerPromptId: 'prompt-1',
         prompt: 'hi',
       });
+      expect(store?.getAgent('main')?.getPrompt('prompt-1')).toMatchObject({ status: 'running' });
+      expect(store?.getAgent('sub-1')?.getPrompt('prompt-goal')).toBeUndefined();
       service.dropSession('s1');
     } finally {
       await rm(home, { recursive: true, force: true });

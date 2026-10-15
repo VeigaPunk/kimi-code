@@ -1,4 +1,4 @@
-import type { UserPromptOrigin } from '#/agent/contextMemory/types';
+import type { PromptOrigin, UserPromptOrigin } from '#/agent/contextMemory/types';
 /* oxlint-disable typescript-eslint/no-unsafe-declaration-merging, eslint-plugin-import/namespace -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
 import { type IDisposable } from '#/_base/di/lifecycle';
 import { Service } from '#/_base/di/service';
@@ -243,7 +243,7 @@ export class AgentConversationUndoService
       .filter(
         (item) =>
           item.meta?.tracked === true &&
-          (item.meta?.origin === undefined || item.meta.origin.kind === 'user'),
+          (item.meta?.origin as PromptOrigin | undefined)?.kind !== 'system_trigger',
       )
       .at(-1);
     let lastPrompt = pending === undefined
