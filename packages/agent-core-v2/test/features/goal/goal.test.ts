@@ -504,12 +504,14 @@ describe('AgentGoalService', () => {
       const loop = ctx.get(IAgentLoopService);
       const eventBus = ctx.get(IEventBus);
       let continuationPromptId: string | undefined;
+      let continuationTurnId: number | undefined;
       const steered: PromptSteered[] = [];
       const turnSteers: TurnSteer[] = [];
       const lifecyclePromptIds: string[] = [];
       eventBus.subscribe(TurnStarted, (event) => {
         if (event.origin.kind === 'system_trigger' && event.origin.name === 'goal_continuation') {
           continuationPromptId = event.promptId;
+          continuationTurnId = event.turnId;
         }
       });
       eventBus.subscribe(PromptSteered, (event) => steered.push(event));
@@ -539,16 +541,12 @@ describe('AgentGoalService', () => {
 
       expect(continuationPromptId).toBeDefined();
       expect(loop.snapshot().activePromptId).toBe(continuationPromptId);
-      const { id: steerId } = loop.submit(
-        {
-          message: { role: 'user', content: [{ type: 'text', text: 'redirect mid-turn' }] },
-          meta: { origin: { kind: 'user' }, tracked: true },
-        },
-        { steerIfActive: true },
-      );
-      expect(steered.map((event) => [event.activePromptId, event.promptIds])).toEqual([
-        [continuationPromptId, [steerId]],
-      ]);
+      const steerResult = await ctx.rpc.steer({
+        input: [{ type: 'text', text: 'redirect mid-turn' }],
+      });
+      expect(steerResult?.turn_id).toBe(continuationTurnId);
+      expect(steered.map((event) => event.activePromptId)).toEqual([continuationPromptId]);
+      expect(steered[0]?.promptIds).toHaveLength(1);
 
       releaseStep();
       await vi.waitFor(() => expect(turnSteers).toHaveLength(1));
