@@ -2,8 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PassThrough, Readable, type Writable } from 'node:stream';
 
 import { isUserCancellation } from '#/_base/utils/abort';
-import { TurnEnded } from '#/agent/loop/turnOps';
+import { TurnEnded, TurnSteer } from '#/agent/loop/turnOps';
 import { TurnStarted } from '#/agent/loop/turnEvents';
+import {
+  PromptAborted,
+  PromptCompleted,
+  PromptStarted,
+  PromptSteered,
+  PromptSubmitted,
+} from '#/agent/prompt/promptEvents';
 
 import type { IDisposable } from '#/_base/di/lifecycle';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
@@ -484,6 +491,72 @@ describe('AgentGoalService', () => {
       expect(goals.getGoal().goal).toBeNull();
     });
 
+    it('steers user input into a running goal continuation without prompt lifecycle events', async () => {
+      await ctx.restorePersisted();
+      ctx.configure({ tools: ['UpdateGoal'] });
+      ctx.mockNextResponse({
+        type: 'function',
+        id: 'complete-goal',
+        name: 'UpdateGoal',
+        arguments: JSON.stringify({ status: 'complete' }),
+      });
+      ctx.mockNextResponse({ type: 'text', text: 'Goal completed.' });
+      const loop = ctx.get(IAgentLoopService);
+      const eventBus = ctx.get(IEventBus);
+      let continuationPromptId: string | undefined;
+      const steered: PromptSteered[] = [];
+      const turnSteers: TurnSteer[] = [];
+      const lifecyclePromptIds: string[] = [];
+      eventBus.subscribe(TurnStarted, (event) => {
+        if (event.origin.kind === 'system_trigger' && event.origin.name === 'goal_continuation') {
+          continuationPromptId = event.promptId;
+        }
+      });
+      eventBus.subscribe(PromptSteered, (event) => steered.push(event));
+      eventBus.subscribe(TurnSteer, (event) => turnSteers.push(event));
+      eventBus.subscribe(PromptSubmitted, (event) => lifecyclePromptIds.push(event.promptId));
+      eventBus.subscribe(PromptStarted, (event) => lifecyclePromptIds.push(event.promptId));
+      eventBus.subscribe(PromptCompleted, (event) => lifecyclePromptIds.push(event.promptId));
+      eventBus.subscribe(PromptAborted, (event) => lifecyclePromptIds.push(event.promptId));
+      let releaseStep!: () => void;
+      let markHeld!: () => void;
+      const stepHeld = new Promise<void>((resolve) => { markHeld = resolve; });
+      const stepGate = new Promise<void>((resolve) => { releaseStep = resolve; });
+      let armed = true;
+      loop.hooks.onWillBeginStep.register('test-hold-continuation-step', async (_hookCtx, next) => {
+        if (armed) {
+          armed = false;
+          markHeld();
+          await stepGate;
+        }
+        await next();
+      });
+
+      await goals.createGoal({ objective: 'finish the task' });
+      await goals.markBlocked({ reason: 'need credentials' });
+      await goals.resumeGoal({ continueIfBlocked: true });
+      await stepHeld;
+
+      expect(continuationPromptId).toBeDefined();
+      expect(loop.snapshot().activePromptId).toBe(continuationPromptId);
+      const { id: steerId } = loop.submit(
+        {
+          message: { role: 'user', content: [{ type: 'text', text: 'redirect mid-turn' }] },
+          meta: { origin: { kind: 'user' }, tracked: true },
+        },
+        { steerIfActive: true },
+      );
+      expect(steered.map((event) => [event.activePromptId, event.promptIds])).toEqual([
+        [continuationPromptId, [steerId]],
+      ]);
+
+      releaseStep();
+      await vi.waitFor(() => expect(turnSteers).toHaveLength(1));
+      await loop.settled();
+      expect(goals.getGoal().goal).toBeNull();
+      expect(lifecyclePromptIds).not.toContain(continuationPromptId);
+    });
+
     it('pauseOnInterrupt parks active goals and no-ops for stopped goals', async () => {
       await goals.createGoal({ objective: 'work', completionCriterion: 'tests pass' });
       const paused = await goals.pauseOnInterrupt({ reason: 'Paused after interruption' });
@@ -887,21 +960,6 @@ describe('AgentGoalService core workflow hooks', () => {
     eventBus.publish(new TurnStarted({ agentId: 'main', turnId: turn.id, origin: USER_PROMPT_ORIGIN }));
     return abort;
   }
-
-  it('starts a continuation when a user resumes an idle blocked goal', async () => {
-    await goals.createGoal({ objective: 'finish the task' });
-    await goals.markBlocked({ reason: 'need credentials' });
-
-    const resumed = await goals.resumeGoal({ continueIfBlocked: true });
-
-    expect(resumed.status).toBe('active');
-    expect(loopService.launches).toHaveLength(1);
-    expect(loopService.drainNextBatch(context)).toBeDefined();
-    expect(context.get().at(-1)?.origin).toEqual({
-      kind: 'system_trigger',
-      name: 'goal_continuation',
-    });
-  });
 
   it.each([{ status: 'paused' as const }, { status: 'blocked' as const }])(
     'queues a continuation when a live non-goal turn resumes a $status goal',
@@ -1607,7 +1665,7 @@ describe('AgentGoalService core workflow hooks', () => {
     expect(prompt).toContain('Pick up where that turn stopped');
   });
 
-  it('blocks active goals when the user prompt hook blocks the turn', async () => {
+  it('blocks active goals when the user prompt hook blocks the turn or its continuation', async () => {
     await goals.createGoal({ objective: 'finish the task' });
 
     const turn = makeTurn(5);
@@ -1619,6 +1677,16 @@ describe('AgentGoalService core workflow hooks', () => {
       terminalReason: 'Blocked by UserPromptSubmit hook',
     });
     expect(loopService.launches).toEqual([]);
+
+    vi.spyOn(loopService, 'promptHandle').mockReturnValue({
+      launched: Promise.resolve(undefined),
+      completion: Promise.resolve({ promptId: 'p', result: undefined, state: 'blocked' }),
+    } as unknown as PromptHandle);
+    await goals.resumeGoal({ continueIfBlocked: true });
+
+    await vi.waitFor(() => expect(goals.getGoal().goal?.status).toBe('blocked'));
+    expect(goals.getGoal().goal?.terminalReason).toBe('Blocked by UserPromptSubmit hook');
+    expect(loopService.launches).toHaveLength(1);
   });
 
   it('pauses the goal when the continuation launch fails', async () => {

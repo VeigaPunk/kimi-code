@@ -2283,7 +2283,7 @@ describe('AgentTranscriptProjector', () => {
     });
   });
 
-  it('prefers store prompt content after backfill over a pre-backfill steered cache', () => {
+  it('leaves an unknown steer parent unframed and keeps backfill authoritative', () => {
     const prompts = new Map<string, NonNullable<ReturnType<AgentTranscript['getPrompt']>>>();
     const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID, {
       prompt: (promptId) => prompts.get(promptId),
@@ -2305,7 +2305,11 @@ describe('AgentTranscriptProjector', () => {
         steeredAt: '2026-01-01T00:00:02.000Z',
       }),
     );
-    expect(tx.getPrompt('p1')?.content).toEqual([{ type: 'text', text: 'second' }]);
+    expect(tx.getPrompt('p1')).toBeUndefined();
+    expect(tx.getPrompt('p2')).toMatchObject({
+      status: 'completed',
+      steeredAt: '2026-01-01T00:00:02.000Z',
+    });
 
     const restored = {
       promptId: 'p1',
@@ -2336,6 +2340,7 @@ describe('AgentTranscriptProjector', () => {
     const tx = new AgentTranscript('main');
     const feed = (event: ProjectorBusEvent): void => void tx.apply(projector.map(event));
 
+    feed(ev({ type: 'prompt.started', promptId: 'p1' }));
     feed(
       ev({
         type: 'prompt.steered',
@@ -2733,7 +2738,7 @@ describe('AgentTranscriptProjector', () => {
         messageId: 'm-mid',
       }),
     );
-    expect(ops).toHaveLength(2);
+    expect(ops).toHaveLength(1);
     expect(ops.every((op) => op.op === 'prompt.upsert')).toBe(true);
 
     feed(ev({ type: 'turn.step.started', turnId: 3, step: 2 }));
